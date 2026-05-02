@@ -53,6 +53,106 @@ DATASET_DIR = f"{DATA_DIR}/dataset"
 LOGS_DIR = f"{STYTTS2_DIR}/logs/kokoro-tamil"
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Helper functions for patching StyleTTS2 code
+# ─────────────────────────────────────────────────────────────────────────────
+
+def patch_models_py(models_path):
+    """
+    Patch models.py to fix fragile patching issues and Conv2d kernel size errors.
+    
+    This function:
+    1. Removes ALL previous broken patches (inline comments, orphaned imports, etc.)
+    2. Applies the Conv2d fix: padding=0 → padding=2 to prevent kernel size errors
+    3. Returns True if patches were applied, False if file doesn't exist
+    """
+    import re as _re
+    
+    if not os.path.exists(models_path):
+        return False
+    
+    with open(models_path, "r") as f:
+        models_src = f.read()
+    
+    patched = False
+    
+    # Remove ALL previous broken patches comprehensively
+    
+    # 1. Remove any inline comments inside spectral_norm() calls that break Python syntax
+    broken_conv5 = "nn.Conv2d(dim_out, dim_out, 5, 1, 2)  # padding=2 (same) to prevent kernel size error"
+    if broken_conv5 in models_src:
+        models_src = models_src.replace(broken_conv5, "nn.Conv2d(dim_out, dim_out, 5, 1, 2)")
+        patched = True
+        print("✓ Removed broken inline comment from previous Conv2d patch")
+    
+    # 2. Remove ALL instances of orphaned import lines (not just when paired)
+    models_src = _re.sub(r'\s*import torch\.nn\.functional as _F\n', '', models_src)
+    models_src = _re.sub(r'\s*_min_dim = \d+\n', '', models_src)
+    
+    # 3. Remove ALL "Safety: pad small inputs" comment blocks AND the code between them
+    if "Safety: pad small inputs" in models_src:
+        print("⚠ Found old runtime-padding patches, removing them (superseded by Conv2d padding=2)")
+        # Remove all padding blocks with comprehensive regex
+        models_src = _re.sub(
+            r'\n\s*# Safety: pad small inputs.*?\n\s*x = _F\.pad\(x, \([^)]+\)[^)]*\)\n',
+            '\n', models_src, flags=_re.DOTALL
+        )
+        patched = True
+    
+    # 4. Apply the Conv2d fix: padding=0 → padding=2
+    old_conv5 = "nn.Conv2d(dim_out, dim_out, 5, 1, 0)"
+    new_conv5 = "nn.Conv2d(dim_out, dim_out, 5, 1, 2)"
+    if old_conv5 in models_src:
+        models_src = models_src.replace(old_conv5, new_conv5)
+        conv_count = models_src.count(new_conv5)
+        print(f"✓ Patched models.py: Conv2d(5,1,0)→Conv2d(5,1,2) in {conv_count} places")
+        patched = True
+    elif new_conv5 in models_src:
+        print("✓ Conv2d padding fix already applied in models.py")
+    else:
+        print("⚠ Could not find Conv2d(dim_out, dim_out, 5, 1, 0) in models.py")
+    
+    # Write back the cleaned version
+    if patched:
+        with open(models_path, "w") as f:
+            f.write(models_src)
+    
+    return patched
+
+
+def patch_slmadv_py(slmadv_path):
+    """
+    Patch slmadv.py to guard against too-small mel segments.
+    
+    Ensures mel_len >= 40 in SLMAdversarialLoss.forward() to prevent
+    Conv2d kernel size errors after downsampling.
+    
+    Returns True if patches were applied, False if file doesn't exist.
+    """
+    if not os.path.exists(slmadv_path):
+        return False
+    
+    with open(slmadv_path, "r") as f:
+        slmadv_src = f.read()
+    
+    # The original line: mel_len = max(int(min(output_lengths) / 2 - 1), self.min_len // 2)
+    # Change the floor from self.min_len // 2 to max(self.min_len // 2, 40)
+    old_mellen = "mel_len = max(int(min(output_lengths) / 2 - 1), self.min_len // 2)"
+    new_mellen = "mel_len = max(int(min(output_lengths) / 2 - 1), max(self.min_len // 2, 40))"
+    
+    if old_mellen in slmadv_src and "max(self.min_len // 2, 40)" not in slmadv_src:
+        slmadv_src = slmadv_src.replace(old_mellen, new_mellen)
+        with open(slmadv_path, "w") as f:
+            f.write(slmadv_src)
+        print("✓ Patched slmadv.py: mel_len floor increased to max(min_len//2, 40)")
+        return True
+    elif "max(self.min_len // 2, 40)" in slmadv_src:
+        print("✓ slmadv.py already patched with mel_len floor guard")
+        return False
+    else:
+        print("⚠ Could not find mel_len line in slmadv.py to patch")
+        return False
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Build Image
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -84,7 +184,7 @@ train_image = (
         # Git LFS for model downloads
         "git lfs install",
     )
-    .env({"_REBUILD_TRIGGER": "2026-05-02-v10"})  # Force image rebuild
+    .env({"_REBUILD_TRIGGER": "2026-05-02-v11"})  # Force image rebuild
     .pip_install(
         # Transformers — MUST pin to 4.47.1 to avoid torch>=2.6 requirement
         "transformers==4.47.1",
@@ -645,6 +745,18 @@ def setup_training(hf_token: str):
     shutil.copy2(config_src, config_dst2)
     print(f"✓ Copied config: {config_dst2}")
 
+    # ── Patch models.py and slmadv.py: Fix issues BEFORE import check ──────
+    # Apply full patching logic (not just limited pre-fix) to ensure
+    # import verification sees clean Python syntax
+    models_path = f"{STYTTS2_DIR}/models.py"
+    slmadv_path = f"{STYTTS2_DIR}/Modules/slmadv.py"
+    
+    if os.path.exists(models_path):
+        patch_models_py(models_path)
+    
+    if os.path.exists(slmadv_path):
+        patch_slmadv_py(slmadv_path)
+
     # ── Verify imports ────────────────────────────────────────────────────
     os.chdir(STYTTS2_DIR)
     result = subprocess.run(
@@ -946,94 +1058,12 @@ def train_stage2(hf_token: str, resume_epoch: int = 0):
         f.write(config_text)
     print(f"✓ Patched config: slmadv min_len → 192")
 
-    # ── Patch models.py: Fix Conv2d kernel size error ──────────────────────
-    # Discriminator2d and StyleEncoder both have Conv2d(dim_out, dim_out, 5, 1, 0)
-    # after 4 ResBlk halvings. Small inputs become 5x3 — too small for kernel 5x5
-    # with padding=0. Fix: change padding=0 to padding=2 (same-padding).
-    # Safe because: both are followed by AdaptiveAvgPool2d(1), so output shape
-    # is always (batch, dim) regardless of input spatial dims. Weight tensors
-    # are unchanged (still [dim_out, dim_out, 5, 5]), so pretrained weights load fine.
+    # ── Patch models.py and slmadv.py using helper functions ──────────────
     models_path = f"{STYTTS2_DIR}/models.py"
-    if os.path.exists(models_path):
-        with open(models_path, "r") as f:
-            models_src = f.read()
-
-        patched = 0
-        # First: fix any broken comment from previous run (inline comment breaks list syntax)
-        # e.g. "nn.Conv2d(dim_out, dim_out, 5, 1, 2)  # padding=2..." → "nn.Conv2d(dim_out, dim_out, 5, 1, 2)"
-        broken_conv5 = "nn.Conv2d(dim_out, dim_out, 5, 1, 2)  # padding=2 (same) to prevent kernel size error"
-        if broken_conv5 in models_src:
-            models_src = models_src.replace(broken_conv5, "nn.Conv2d(dim_out, dim_out, 5, 1, 2)")
-            print("✓ Removed broken inline comment from previous Conv2d patch")
-
-        # Fix Conv2d(dim_out, dim_out, 5, 1, 0) → Conv2d(dim_out, dim_out, 5, 1, 2)
-        # This appears in both StyleEncoder and Discriminator2d
-        old_conv5 = "nn.Conv2d(dim_out, dim_out, 5, 1, 0)"
-        new_conv5 = "nn.Conv2d(dim_out, dim_out, 5, 1, 2)"
-        if old_conv5 in models_src:
-            models_src = models_src.replace(old_conv5, new_conv5)
-            patched += models_src.count(new_conv5)
-        elif "Conv2d(dim_out, dim_out, 5, 1, 2)" in models_src:
-            print("✓ Conv2d padding fix already applied in models.py")
-        else:
-            print("⚠ Could not find Conv2d(dim_out, dim_out, 5, 1, 0) in models.py")
-
-        # Also remove any previous F.pad reflect/constant patches from earlier runs
-        # (they're no longer needed with padding=2 and can cause their own errors)
-        bad_pad_patterns = [
-            "import torch.nn.functional as _F\n        _min_dim =",
-            "if x.size(2) < _min_dim or x.size(3) < _min_dim:",
-            "_pad_h = max(0, _min_dim - x.size(2))",
-            "_pad_w = max(0, _min_dim - x.size(3))",
-            "x = _F.pad(x, (0, _pad_w, 0, _pad_h)",
-        ]
-        # Check if old runtime-padding patches exist and remove them
-        if "Safety: pad small inputs" in models_src:
-            print("⚠ Found old runtime-padding patches, removing them (superseded by Conv2d padding=2)")
-            # Remove get_feature padding block
-            import re as _re
-            models_src = _re.sub(
-                r'\n        # Safety: pad small inputs.*?x = _F\.pad\(x, \(0, _pad_w, 0, _pad_h\).*?\)\n',
-                '\n', models_src, flags=_re.DOTALL
-            )
-            # Remove forward padding block
-            models_src = _re.sub(
-                r'\n        # Safety: pad small inputs.*?x = _F\.pad\(x, \(0, _pad_w, 0, _pad_h\).*?\)\n',
-                '\n', models_src, flags=_re.DOTALL
-            )
-            # Clean up import lines if any orphaned
-            models_src = models_src.replace("        import torch.nn.functional as _F\n        _min_dim = 80\n", "")
-
-        with open(models_path, "w") as f:
-            f.write(models_src)
-        if patched > 0:
-            print(f"✓ Patched models.py: Conv2d(5,1,0)→Conv2d(5,1,2) in {patched} places")
-    else:
-        print(f"⚠ models.py not found at {models_path}")
-
-    # ── Patch slmadv.py: Guard against too-small mel segments ────────────
-    # In SLMAdversarialLoss.forward(), mel_len can be computed too small.
-    # Ensure mel_len >= 40 (which gives ≥80 frames after ×2, ≥5 after ÷16).
     slmadv_path = f"{STYTTS2_DIR}/Modules/slmadv.py"
-    if os.path.exists(slmadv_path):
-        with open(slmadv_path, "r") as f:
-            slmadv_src = f.read()
-
-        # The original line: mel_len = max(int(min(output_lengths) / 2 - 1), self.min_len // 2)
-        # Change the floor from self.min_len // 2 to max(self.min_len // 2, 40)
-        old_mellen = "mel_len = max(int(min(output_lengths) / 2 - 1), self.min_len // 2)"
-        new_mellen = "mel_len = max(int(min(output_lengths) / 2 - 1), max(self.min_len // 2, 40))"
-        if old_mellen in slmadv_src and "max(self.min_len // 2, 40)" not in slmadv_src:
-            slmadv_src = slmadv_src.replace(old_mellen, new_mellen)
-            with open(slmadv_path, "w") as f:
-                f.write(slmadv_src)
-            print("✓ Patched slmadv.py: mel_len floor increased to max(min_len//2, 40)")
-        elif "max(self.min_len // 2, 40)" in slmadv_src:
-            print("✓ slmadv.py already patched with mel_len floor guard")
-        else:
-            print("⚠ Could not find mel_len line in slmadv.py to patch")
-    else:
-        print(f"⚠ slmadv.py not found at {slmadv_path}")
+    
+    patch_models_py(models_path)
+    patch_slmadv_py(slmadv_path)
 
     config_path = f"{STYTTS2_DIR}/config_tamil_ft.yml"
     cmd = ["python3", f"{STYTTS2_DIR}/train_second.py", "-p", config_path]
