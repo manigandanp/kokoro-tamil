@@ -6,12 +6,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Top-level params (read by train_first.py, NOT from training: block) ─────
-batch_size: 8                          # A100 80GB can handle 8-12; L4: 4
+batch_size: 16                          # A100 80GB with 64GB RAM — maximize throughput
 epochs: 10                             # number of epochs for each stage
 epochs_1st: 10                         # Stage 1 epochs
 epochs_2nd: 10                         # Stage 2 epochs
 save_freq: 1                           # save checkpoint every N epochs
-pretrained_model: "../training/kokoro_base.pth"
+pretrained_model: "/root/data/training/kokoro_base.pth"
 first_stage_path: "first_stage.pth"
 load_only_params: true                 # CRITICAL: ignore missing diffusion/SLM keys
 second_stage_load_pretrained: false    # false = load from first_stage.pth (recommended)
@@ -21,12 +21,12 @@ log_dir: "logs/kokoro-tamil"
 
 # ── Data ─────────────────────────────────────────────────────────────────────
 data_params:
-  train_data: "../training/train_list.txt"
-  val_data: "../training/val_list.txt"
-  root_path: "../dataset/audio"
-  OOD_data: "../training/OOD_texts.txt"
+  train_data: "/root/data/training/train_list.txt"
+  val_data: "/root/data/training/val_list.txt"
+  root_path: "/root/data/dataset/audio"
+  OOD_data: "/root/data/training/OOD_texts.txt"
   min_length: 50                       # min phoneme sequence length (chars)
-  num_workers: 16                      # CPU workers for data loading
+  num_workers: 8                        # Match cpu=8 in Modal
 
 # ── Preprocessing (must match Kokoro-82M exactly) ───────────────────────────
 preprocess_params:
@@ -125,7 +125,7 @@ training:
   save_freq: 2
   log_interval: 10
   eval_interval: 500
-  pretrained_model: "../training/kokoro_base.pth"
+  pretrained_model: "/root/data/training/kokoro_base.pth"
   load_only_params: true
   second_stage_load_pretrained: false
 
@@ -136,7 +136,7 @@ ASR_path: "Utils/ASR/epoch_00080.pth"
 PLBERT_dir: "Utils/PLBERT/"
 
 slmadv_params:
-  min_len: 100
+  min_len: 192
   max_len: 500
   batch_percentage: 0.5
   iter: 10
