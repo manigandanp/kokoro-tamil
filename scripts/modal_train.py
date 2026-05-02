@@ -84,7 +84,7 @@ train_image = (
         # Git LFS for model downloads
         "git lfs install",
     )
-    .env({"_REBUILD_TRIGGER": "2026-05-02-v9"})  # Force image rebuild
+    .env({"_REBUILD_TRIGGER": "2026-05-02-v10"})  # Force image rebuild
     .pip_install(
         # Transformers — MUST pin to 4.47.1 to avoid torch>=2.6 requirement
         "transformers==4.47.1",
@@ -959,14 +959,21 @@ def train_stage2(hf_token: str, resume_epoch: int = 0):
             models_src = f.read()
 
         patched = 0
+        # First: fix any broken comment from previous run (inline comment breaks list syntax)
+        # e.g. "nn.Conv2d(dim_out, dim_out, 5, 1, 2)  # padding=2..." → "nn.Conv2d(dim_out, dim_out, 5, 1, 2)"
+        broken_conv5 = "nn.Conv2d(dim_out, dim_out, 5, 1, 2)  # padding=2 (same) to prevent kernel size error"
+        if broken_conv5 in models_src:
+            models_src = models_src.replace(broken_conv5, "nn.Conv2d(dim_out, dim_out, 5, 1, 2)")
+            print("✓ Removed broken inline comment from previous Conv2d patch")
+
         # Fix Conv2d(dim_out, dim_out, 5, 1, 0) → Conv2d(dim_out, dim_out, 5, 1, 2)
         # This appears in both StyleEncoder and Discriminator2d
         old_conv5 = "nn.Conv2d(dim_out, dim_out, 5, 1, 0)"
-        new_conv5 = "nn.Conv2d(dim_out, dim_out, 5, 1, 2)  # padding=2 (same) to prevent kernel size error"
+        new_conv5 = "nn.Conv2d(dim_out, dim_out, 5, 1, 2)"
         if old_conv5 in models_src:
             models_src = models_src.replace(old_conv5, new_conv5)
             patched += models_src.count(new_conv5)
-        elif "padding=2" in models_src and "kernel size error" in models_src:
+        elif "Conv2d(dim_out, dim_out, 5, 1, 2)" in models_src:
             print("✓ Conv2d padding fix already applied in models.py")
         else:
             print("⚠ Could not find Conv2d(dim_out, dim_out, 5, 1, 0) in models.py")
